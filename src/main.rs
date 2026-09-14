@@ -10,8 +10,8 @@ use tucanos_vtkio::UnstructuredGridWriter;
 #[derive(Debug, Default)]
 pub struct UnvFile {
     pub nodes: Vec<Node>,
-    // TODO: avoid this Vec in Vec (too many malloc)
     pub elements: Vec<Element>,
+    pub element_nodes: Vec<usize>,
     pub groups: Vec<Group>,
 }
 
@@ -27,7 +27,8 @@ pub struct Node {
 pub struct Element {
     pub label: usize,
     pub descriptor: usize,
-    pub nodes: Vec<usize>,
+    pub node_start: usize,
+    pub node_count: usize,
 }
 
 #[derive(Debug)]
@@ -44,6 +45,12 @@ pub struct GroupEntity {
 }
 
 impl UnvFile {
+    /// Retrieves the slice of node labels for the specified element.
+    #[must_use]
+    pub fn get_element_nodes(&self, element: &Element) -> &[usize] {
+        &self.element_nodes[element.node_start..element.node_start + element.node_count]
+    }
+
     pub fn parse_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
@@ -81,15 +88,20 @@ impl UnvFile {
 
     fn parse_nodes_2411(&mut self, lines: &[String]) {
         let mut i = 0;
+        let mut meta_tokens = Vec::new();
+        let mut coords = Vec::new();
+
         while i < lines.len() {
-            let meta_tokens: Vec<&str> = lines[i].split_whitespace().collect();
+            meta_tokens.clear();
+            meta_tokens.extend(lines[i].split_whitespace());
             if meta_tokens.is_empty() || i + 1 >= lines.len() {
                 break;
             }
 
             let label: usize = meta_tokens[0].parse().unwrap_or(0);
-            // TODO: move allocation outside of loop
-            let coords: Vec<_> = lines[i + 1].split_whitespace().collect();
+
+            coords.clear();
+            coords.extend(lines[i + 1].split_whitespace());
             if coords.len() >= 3 {
                 self.nodes.push(Node {
                     label,
@@ -104,9 +116,12 @@ impl UnvFile {
 
     fn parse_elements_2412(&mut self, lines: &[String]) {
         let mut i = 0;
+        let mut meta = Vec::new();
+        let mut node_line = Vec::new();
+
         while i < lines.len() {
-            // TODO: move allocation outside of loop
-            let meta: Vec<_> = lines[i].split_whitespace().collect();
+            meta.clear();
+            meta.extend(lines[i].split_whitespace());
             if meta.len() < 6 || i + 1 >= lines.len() {
                 break;
             }
@@ -123,17 +138,18 @@ impl UnvFile {
                 j += 1;
             }
 
-            let mut node_labels = Vec::new();
             let mut nodes_collected = 0;
+            let node_start = self.element_nodes.len();
 
             while nodes_collected < num_nodes && j < lines.len() {
-                let node_line: Vec<&str> = lines[j].split_whitespace().collect();
-                for n in node_line {
+                node_line.clear();
+                node_line.extend(lines[j].split_whitespace());
+                for n in &node_line {
                     if nodes_collected >= num_nodes {
                         break;
                     }
                     if let Ok(val) = n.parse::<usize>() {
-                        node_labels.push(val);
+                        self.element_nodes.push(val);
                         nodes_collected += 1;
                     }
                 }
@@ -143,7 +159,8 @@ impl UnvFile {
             self.elements.push(Element {
                 label,
                 descriptor,
-                nodes: node_labels,
+                node_start,
+                node_count: nodes_collected,
             });
             i = j;
         }
@@ -151,8 +168,12 @@ impl UnvFile {
 
     fn parse_groups_2467(&mut self, lines: &[String]) {
         let mut i = 0;
+        let mut meta = Vec::new();
+        let mut entity_tokens = Vec::new();
+
         while i < lines.len() {
-            let meta: Vec<_> = lines[i].split_whitespace().collect();
+            meta.clear();
+            meta.extend(lines[i].split_whitespace());
             if meta.is_empty() || i + 2 >= lines.len() {
                 break;
             }
@@ -161,15 +182,14 @@ impl UnvFile {
             let num_entities: usize = meta.last().unwrap_or(&"0").parse().unwrap_or(0);
 
             let name = lines[i + 1].trim().to_string();
-            // TODO: with_capacity ?
-            let mut entities = Vec::new();
+            let mut entities = Vec::with_capacity(num_entities);
 
             let mut j = i + 2;
             let mut entities_collected = 0;
 
             while entities_collected < num_entities && j < lines.len() {
-                // TODO: move allocation outside of loop
-                let entity_tokens: Vec<_> = lines[j].split_whitespace().collect();
+                entity_tokens.clear();
+                entity_tokens.extend(lines[j].split_whitespace());
 
                 // Entity definitions are in pairs: [Type, Tag, Type, Tag, ...]
                 let mut k = 0;
@@ -309,18 +329,18 @@ impl UnvFile {
             };
 
             let mut valid_nodes = Vec::new();
-            for &node_label in &element.nodes {
+            for &node_label in self.get_element_nodes(element) {
                 if let Some(&idx) = node_map.get(&node_label) {
                     valid_nodes.push(idx);
                 }
             }
 
-            if valid_nodes.len() != element.nodes.len() {
+            if valid_nodes.len() != element.node_count {
                 continue;
             }
 
             connectivity.extend(valid_nodes);
-            current_offset += element.nodes.len();
+            current_offset += element.node_count;
             offsets.push(current_offset);
             cell_types.push(vtk_type);
             global_element_ids.push(element.label);
