@@ -207,6 +207,61 @@ impl UnvFile {
         }
     }
 
+    /// Builds hashmaps mapping entity tags to their corresponding group IDs.
+    fn build_group_maps(&self) -> (FxHashMap<usize, Vec<usize>>, FxHashMap<usize, Vec<usize>>) {
+        let mut node_to_groups: FxHashMap<_, Vec<_>> = FxHashMap::default();
+        let mut elem_to_groups: FxHashMap<_, Vec<_>> = FxHashMap::default();
+
+        // Map groups to elements (entity_type 8) and nodes (entity_type 7)
+        // An entity can belong to multiple groups, so we use a Vec<usize>
+        for group in &self.groups {
+            for entity in &group.entities {
+                match entity.entity_type {
+                    7 => node_to_groups
+                        .entry(entity.entity_tag)
+                        .or_default()
+                        .push(group.id),
+                    8 => elem_to_groups
+                        .entry(entity.entity_tag)
+                        .or_default()
+                        .push(group.id),
+                    _ => {}
+                }
+            }
+        }
+        (node_to_groups, elem_to_groups)
+    }
+
+    /// Prepares `PointData` vectors (`NodeGroupIDs` and `GlobalNodeIDs`).
+    fn extract_point_data(
+        &self,
+        node_to_groups: &FxHashMap<usize, Vec<usize>>,
+    ) -> (Vec<Vec<usize>>, Vec<usize>) {
+        // Determine the maximum number of groups any single node belongs to
+        // (Ensure at least 1 column for output consistency even if there are no groups)
+        let max_node_groups = self
+            .nodes
+            .iter()
+            .map(|n| node_to_groups.get(&n.label).map_or(0, Vec::len))
+            .max()
+            .unwrap_or(0)
+            .max(1);
+
+        let mut point_group_ids = vec![Vec::with_capacity(self.nodes.len()); max_node_groups];
+        let mut global_node_ids = Vec::with_capacity(self.nodes.len());
+
+        for node in &self.nodes {
+            let groups = node_to_groups
+                .get(&node.label)
+                .map_or(&[] as &[usize], Vec::as_slice);
+            for (k, grp) in point_group_ids.iter_mut().enumerate() {
+                grp.push(groups.get(k).copied().unwrap_or(0));
+            }
+            global_node_ids.push(node.label);
+        }
+        (point_group_ids, global_node_ids)
+    }
+
     /// Exports the UNV mesh structure to a VTU file at the specified output path.
     ///
     /// # Arguments
@@ -223,39 +278,22 @@ impl UnvFile {
         for (idx, node) in self.nodes.iter().enumerate() {
             node_map.insert(node.label, idx);
         }
+        let (node_to_groups, elem_to_groups) = self.build_group_maps();
+        let max_elem_groups = self
+            .elements
+            .iter()
+            .map(|e| elem_to_groups.get(&e.label).map_or(0, Vec::len))
+            .max()
+            .unwrap_or(0)
+            .max(1);
 
-        // TODO: and element or a node can be in multiple groups. use a Vec<FxHashMap>.
-        // Map groups to elements (entity_type 8) and nodes (entity_type 7)
-        let mut elem_to_group = FxHashMap::default();
-        let mut node_to_group = FxHashMap::default();
-
-        for group in &self.groups {
-            for entity in &group.entities {
-                match entity.entity_type {
-                    7 => {
-                        node_to_group.insert(entity.entity_tag, group.id);
-                    } // Node Group
-                    8 => {
-                        elem_to_group.insert(entity.entity_tag, group.id);
-                    } // Element Group
-                    _ => {}
-                }
-            }
-        }
-
-        // Prepare Point Data (Node Groups & Original UNV Node Labels)
-        let mut point_group_ids = Vec::with_capacity(self.nodes.len());
-        let mut global_node_ids = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
-            point_group_ids.push(node_to_group.get(&node.label).copied().unwrap_or(0));
-            global_node_ids.push(node.label);
-        }
+        let (point_group_ids, global_node_ids) = self.extract_point_data(&node_to_groups);
 
         // Prepare Cell Data & Connectivity
         let mut connectivity = Vec::new();
         let mut offsets = Vec::new();
         let mut cell_types = Vec::new();
-        let mut cell_group_ids = Vec::new();
+        let mut cell_group_ids = vec![Vec::new(); max_elem_groups];
         let mut global_element_ids = Vec::new();
         let mut current_offset = 0;
 
@@ -283,11 +321,16 @@ impl UnvFile {
 
             connectivity.extend(valid_nodes);
             current_offset += element.nodes.len();
-
             offsets.push(current_offset);
             cell_types.push(vtk_type);
-            cell_group_ids.push(elem_to_group.get(&element.label).copied().unwrap_or(0));
             global_element_ids.push(element.label);
+
+            let groups = elem_to_groups
+                .get(&element.label)
+                .map_or(&[] as &[usize], Vec::as_slice);
+            for (k, grp) in cell_group_ids.iter_mut().enumerate() {
+                grp.push(groups.get(k).copied().unwrap_or(0));
+            }
         }
 
         let num_points = self.nodes.len();
@@ -295,8 +338,7 @@ impl UnvFile {
         let mut vtu_writer = UnstructuredGridWriter::default();
         vtu_writer.set_num_cells(num_cells);
         vtu_writer.set_num_points(num_points);
-        // TODO we need GroupIDs2 / GroupNames2, GroupIDs3 / GroupNames3, ... because an element or
-        // a node can be in multiple groupes. We also need NodeGroupID2, GroupID2, ...
+
         // Write FieldData (Group Name & ID Dictionary)
         if !self.groups.is_empty() {
             vtu_writer.add_field_data(
@@ -307,11 +349,27 @@ impl UnvFile {
             );
             vtu_writer.add_field_str("GroupNames", 1, self.groups.iter().map(|g| g.name.as_str()));
         }
-        vtu_writer.add_point_data("NodeGroupID", 1, point_group_ids);
+
+        // Write dynamic PointData for groups (NodeGroupID, NodeGroupID2, ...)
+        for (k, array) in point_group_ids.into_iter().enumerate() {
+            let name = if k == 0 {
+                "NodeGroupID".to_string()
+            } else {
+                format!("NodeGroupID{}", k + 1)
+            };
+            vtu_writer.add_point_data(&name, 1, array);
+        }
         vtu_writer.add_point_data("GlobalNodeID", 1, global_node_ids);
         vtu_writer.add_points(self.nodes.iter().flat_map(|n| [n.x, n.y, n.z]));
         vtu_writer.add_cells(connectivity.len(), connectivity, offsets, cell_types);
-        vtu_writer.add_cell_data("GroupID", 1, cell_group_ids);
+        for (k, array) in cell_group_ids.into_iter().enumerate() {
+            let name = if k == 0 {
+                "GroupID".to_string()
+            } else {
+                format!("GroupID{}", k + 1)
+            };
+            vtu_writer.add_cell_data(&name, 1, array);
+        }
         vtu_writer.add_cell_data("GlobalElementID", 1, global_element_ids);
         vtu_writer.write(&mut BufWriter::new(File::create(path)?))?;
         Ok(())
