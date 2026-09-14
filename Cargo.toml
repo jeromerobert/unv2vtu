@@ -6,7 +6,7 @@ description = "Converts UNV mesh files into VTU format."
 
 [dependencies]
 tucanos-vtkio = { git = "https://github.com/tucanos/tucanos.git", rev="20b000e" }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6", features = ["derive"] }
 rustc-hash = "2.1"
 
 [lints.rust]
